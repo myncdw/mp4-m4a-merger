@@ -65,14 +65,15 @@ def merge_media(folder, progress_queue):
     output_folder = os.path.join(folder, "output")
     os.makedirs(output_folder, exist_ok=True)
 
-    # 线程数控制：最少 2，最多 10，如果 CPU 核心数的一半小于 10，则用其值
+    # 线程数控制：最少 2，最多 8，根据 CPU 核心数调整
     total_cores = multiprocessing.cpu_count()
-    max_workers = min(max(2, total_cores // 2), 10)
+    max_workers = min(max(2, total_cores // 4), 8)
 
     # 每个 FFmpeg 内部线程
     ffmpeg_threads = max(1, total_cores // max_workers)
 
     progress_queue.put(("log", f"找到 {total_videos} 个视频文件"))
+    progress_queue.put(("log", f"共有 {total_cores} 个可用线程"))
     progress_queue.put(("log", f"使用 {max_workers} 个线程并行处理\n"))
 
     futures = {}
