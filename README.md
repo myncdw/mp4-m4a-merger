@@ -31,6 +31,7 @@
 ## 工作原理（简要）
 - 脚本会列出所选文件夹内所有 .mp4 文件，按同名规则查找对应的 .m4a 音频。
 - 使用多个 worker（ThreadPoolExecutor）并行调用 ffmpeg，每个 ffmpeg 使用若干内部线程以提高性能。
+- 支持选择更快的编码 preset，并可启用或禁用 `-movflags +faststart`，减少最后阶段写入 header 的耗时。
 - 合并命令示例：
   `ffmpeg -i input.mp4 -i input.m4a -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 -threads N -y output.mp4`
 
