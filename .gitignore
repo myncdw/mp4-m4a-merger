@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地启动脚本（含绝对路径，仅本机使用，不提交）
+*.sh
+*.desktop

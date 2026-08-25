@@ -1,4 +1,6 @@
 import os
+import sys
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import subprocess
@@ -8,8 +10,55 @@ import threading
 import queue
 import traceback
 from datetime import datetime
+from dialogs import choose_folder
 
-FFMPEG_PATH = r"C:\Tools\ffmpeg\bin\ffmpeg.exe"  # 请修改为你的 ffmpeg.exe 实际路径
+# ================= 平台检测 =================
+IS_WINDOWS = sys.platform.startswith("win")
+# 仅在 Windows 上有意义，其它平台为 0（Popen 会忽略该参数）
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# ================= 默认值配置（放在开头集中管理） =================
+# FFmpeg 可执行文件路径（Windows 示例: r"C:\Tools\ffmpeg\bin\ffmpeg.exe"）
+DEFAULT_FFMPEG_PATH = "ffmpeg"  # Linux 下默认路径，请按需修改
+
+# 文件选择对话框默认打开的文件夹（留空 "" 则使用系统默认位置）
+# 示例: DEFAULT_FOLDER = r"D:\Videos"  （Windows） 或  DEFAULT_FOLDER = "/home/user/Videos"
+DEFAULT_FOLDER = "/home/myncdw/下载/"
+
+# 默认线程数上限（实际取 min(默认值, CPU相关计算)）
+DEFAULT_MAX_WORKERS = 8
+
+
+def resolve_ffmpeg_path():
+    """跨平台解析 ffmpeg 路径：优先使用配置路径，否则从 PATH 中查找。"""
+    if IS_WINDOWS and os.path.isfile(DEFAULT_FFMPEG_PATH):
+        return DEFAULT_FFMPEG_PATH
+    found = shutil.which("ffmpeg")
+    return found or DEFAULT_FFMPEG_PATH
+
+
+FFMPEG_PATH = resolve_ffmpeg_path()  # Linux 下通常为 PATH 中的 "ffmpeg"
+
+
+def get_ffprobe_path():
+    """跨平台获取 ffprobe 可执行文件路径。"""
+    probe_exe = "ffprobe.exe" if IS_WINDOWS else "ffprobe"
+    local = os.path.join(os.path.dirname(FFMPEG_PATH), probe_exe)
+    if os.path.isfile(local):
+        return local
+    return shutil.which("ffprobe") or probe_exe
+
+# ================= 字体常量（按平台选择，可自行调整） =================
+FONT_FAMILY = "微软雅黑" if IS_WINDOWS else "Noto Sans CJK SC"
+FONT_NUMERIC = "Arial" if IS_WINDOWS else "DejaVu Sans Mono"
+
+FONT_TITLE = (FONT_FAMILY, 16, "bold")       # 主标题
+FONT_PERCENT = (FONT_NUMERIC, 12, "bold")    # 进度百分比
+FONT_NORMAL = (FONT_FAMILY, 10)              # 普通文本
+FONT_SMALL = (FONT_FAMILY, 9)                # 小号辅助文本
+FONT_BTN_BOLD = (FONT_FAMILY, 11, "bold")    # 主按钮
+FONT_BTN = (FONT_FAMILY, 11)                 # 普通按钮
+FONT_TABLE = (FONT_FAMILY, 10)               # 表格/分组标题
 
 
 def build_ffmpeg_command(video_path, audio_path, output_path, ffmpeg_threads):
@@ -33,9 +82,7 @@ def build_ffmpeg_command(video_path, audio_path, output_path, ffmpeg_threads):
 
 def get_media_duration(video_path):
     """返回视频时长（秒），用于估算进度百分比。"""
-    ffprobe_path = os.path.join(os.path.dirname(FFMPEG_PATH), "ffprobe.exe")
-    if not os.path.exists(ffprobe_path):
-        return None
+    ffprobe_path = get_ffprobe_path()
 
     cmd = [
         ffprobe_path,
@@ -46,7 +93,7 @@ def get_media_duration(video_path):
     ]
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                creationflags=subprocess.CREATE_NO_WINDOW)
+                                creationflags=CREATE_NO_WINDOW)
         if result.returncode != 0:
             return None
         return float(result.stdout.strip())
@@ -96,7 +143,7 @@ def merge_single_media(video_path, audio_path, output_path, ffmpeg_threads, prog
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=CREATE_NO_WINDOW,
             bufsize=1,
         )
         stderr_lines = []
@@ -255,6 +302,12 @@ def start_merge_thread(folder, progress_queue, stop_event, max_workers):
     """在后台线程运行合并任务。"""
     threading.Thread(target=merge_media, args=(folder, progress_queue, stop_event, max_workers), daemon=True).start()
 
+
+def choose_directory(initial_dir=None, title="选择文件夹"):
+    """通过 dialogs.py 选择文件夹，取消时返回空字符串。"""
+    return choose_folder(title=title, initial_dir=initial_dir)
+
+
 def select_folder_and_merge():
     """创建 GUI 并处理文件夹选择"""
     root = tk.Tk()
@@ -268,9 +321,9 @@ def select_folder_and_merge():
     estimate_by_file = {}
     stop_event = threading.Event()
     total_cores = multiprocessing.cpu_count()
-    default_workers = min(max(2, total_cores // 4), 8)
+    default_workers = min(DEFAULT_MAX_WORKERS, max(2, total_cores // 4))
 
-    title_label = tk.Label(root, text="视频音频合并工具", font=("微软雅黑", 16, "bold"))
+    title_label = tk.Label(root, text="视频音频合并工具", font=FONT_TITLE)
     title_label.pack(pady=10)
 
     progress_frame = tk.Frame(root)
@@ -279,10 +332,10 @@ def select_folder_and_merge():
     progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", length=500, mode="determinate")
     progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-    percent_label = tk.Label(progress_frame, text="0%", font=("Arial", 12, "bold"), width=6)
+    percent_label = tk.Label(progress_frame, text="0%", font=FONT_PERCENT, width=6)
     percent_label.pack(side=tk.LEFT, padx=5)
 
-    status_label = tk.Label(root, text="等待开始...", font=("微软雅黑", 10))
+    status_label = tk.Label(root, text="等待开始...", font=FONT_NORMAL)
     status_label.pack(pady=5)
 
     settings_frame = tk.Frame(root)
@@ -295,7 +348,7 @@ def select_folder_and_merge():
     thread_entry.pack(side=tk.LEFT, padx=(0, 8))
     cpu_label = tk.Label(settings_frame, text=f"CPU总数: {total_cores}")
     cpu_label.pack(side=tk.LEFT, padx=(0, 8))
-    reset_thread_btn = tk.Button(settings_frame, text="恢复默认", command=lambda: thread_var.set(str(default_workers)), font=("微软雅黑", 9))
+    reset_thread_btn = tk.Button(settings_frame, text="恢复默认", command=lambda: thread_var.set(str(default_workers)), font=FONT_SMALL)
     reset_thread_btn.pack(side=tk.LEFT)
 
     button_frame = tk.Frame(root)
@@ -309,7 +362,10 @@ def select_folder_and_merge():
             stop_btn.config(state=tk.DISABLED)
 
     def start_merge():
-        folder_selected = filedialog.askdirectory(title="选择包含视频和音频的文件夹")
+        folder_selected = choose_directory(
+            initial_dir=DEFAULT_FOLDER,
+            title="选择包含视频和音频的文件夹",
+        )
         if folder_selected:
             stop_event.clear()
             progress_bar['value'] = 0
@@ -328,7 +384,7 @@ def select_folder_and_merge():
         button_frame,
         text="选择文件夹并开始合并",
         command=start_merge,
-        font=("微软雅黑", 11, "bold"),
+        font=FONT_BTN_BOLD,
         bg="#4CAF50",
         fg="white",
         activebackground="#45a049",
@@ -341,7 +397,7 @@ def select_folder_and_merge():
         button_frame,
         text="停止",
         command=lambda: stop_event.set(),
-        font=("微软雅黑", 11),
+        font=FONT_BTN,
         bg="#f44336",
         fg="white",
         activebackground="#d32f2f",
@@ -352,11 +408,11 @@ def select_folder_and_merge():
     stop_btn.config(state=tk.DISABLED)
 
     info_text = "说明：选择包含 .mp4 和 .m4a 文件的文件夹，程序将自动匹配并进行无损合并"
-    info_label = tk.Label(root, text=info_text, font=("微软雅黑", 9), fg="gray")
+    info_label = tk.Label(root, text=info_text, font=FONT_SMALL, fg="gray")
     info_label.pack(pady=5)
 
     # 文件状态表格
-    table_frame = tk.LabelFrame(root, text="文件状态", font=("微软雅黑", 10))
+    table_frame = tk.LabelFrame(root, text="文件状态", font=FONT_TABLE)
     table_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
 
     tree = ttk.Treeview(table_frame, columns=("file", "status", "percent"), show="headings", height=12)
