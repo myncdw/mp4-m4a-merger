@@ -1,16 +1,29 @@
+# ============================================================================
+# 模块说明：
+#  本文件是 mp4-m4a-merger 的后端模块（被 main.pyw / ui/app.py 导入使用）。
+#  它负责把同一文件夹内同名的 .mp4（视频流）与 .m4a（音频流）
+#  无损合并成一个 MP4 文件。合并过程使用 FFmpeg 的 -c copy 流复制，
+#  不重新编码，因此速度快且画质/音质无损。
+#
+#  主要职责：
+#   1. 平台检测与 ffmpeg/ffprobe 路径解析
+#   2. 构造无损合并所需的 FFmpeg 命令
+#   3. 探测视频时长并估算最后封装阶段的耗时
+#   4. 后台批量调度 FFmpeg 任务（多文件并行、线程池 + 停止标志）
+#   5. 把进度/状态/结果通过消息队列上报给 GUI（协议常量见下方）
+#
+#  注意：本模块不 import tkinter，可在无 GUI 环境被单独导入
+#  （单元测试、未来的 CLI 等）。UI 相关逻辑在 ui/ 子包中。
+# ============================================================================
+
 import os
 import sys
 import shutil
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing
 import threading
-import queue
 import traceback
-from datetime import datetime
-from dialogs import choose_folder
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 平台检测 =================
 IS_WINDOWS = sys.platform.startswith("win")
@@ -21,19 +34,18 @@ CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # FFmpeg 可执行文件路径（Windows 示例: r"C:\Tools\ffmpeg\bin\ffmpeg.exe"）
 DEFAULT_FFMPEG_PATH = "ffmpeg"  # Linux 下默认路径，请按需修改
 
-# 文件选择对话框默认打开的文件夹（留空 "" 则使用系统默认位置）
-# 示例: DEFAULT_FOLDER = r"D:\Videos"  （Windows） 或  DEFAULT_FOLDER = "/home/user/Videos"
-DEFAULT_FOLDER = "/home/myncdw/下载/"
-
 # 默认线程数上限（实际取 min(默认值, CPU相关计算)）
 DEFAULT_MAX_WORKERS = 8
 
 
 def resolve_ffmpeg_path():
     """跨平台解析 ffmpeg 路径：优先使用配置路径，否则从 PATH 中查找。"""
+    # Windows 下若已手动指定了存在的可执行文件路径，则直接使用该路径
     if IS_WINDOWS and os.path.isfile(DEFAULT_FFMPEG_PATH):
         return DEFAULT_FFMPEG_PATH
+    # 其它平台（如 Linux）通常直接依赖 PATH 环境变量中的 ffmpeg 命令
     found = shutil.which("ffmpeg")
+    # 都找不到时退回默认命令名，让后续调用自然报错，便于用户发现环境问题
     return found or DEFAULT_FFMPEG_PATH
 
 
@@ -43,26 +55,72 @@ FFMPEG_PATH = resolve_ffmpeg_path()  # Linux 下通常为 PATH 中的 "ffmpeg"
 def get_ffprobe_path():
     """跨平台获取 ffprobe 可执行文件路径。"""
     probe_exe = "ffprobe.exe" if IS_WINDOWS else "ffprobe"
+    # 优先使用与 FFMPEG_PATH 同目录下的 ffprobe（常见于绿色版/手动安装）
     local = os.path.join(os.path.dirname(FFMPEG_PATH), probe_exe)
     if os.path.isfile(local):
         return local
+    # 否则从 PATH 中查找，找不到则返回命令名本身
     return shutil.which("ffprobe") or probe_exe
 
-# ================= 字体常量（按平台选择，可自行调整） =================
-FONT_FAMILY = "微软雅黑" if IS_WINDOWS else "Noto Sans CJK SC"
-FONT_NUMERIC = "Arial" if IS_WINDOWS else "DejaVu Sans Mono"
 
-FONT_TITLE = (FONT_FAMILY, 16, "bold")       # 主标题
-FONT_PERCENT = (FONT_NUMERIC, 12, "bold")    # 进度百分比
-FONT_NORMAL = (FONT_FAMILY, 10)              # 普通文本
-FONT_SMALL = (FONT_FAMILY, 9)                # 小号辅助文本
-FONT_BTN_BOLD = (FONT_FAMILY, 11, "bold")    # 主按钮
-FONT_BTN = (FONT_FAMILY, 11)                 # 普通按钮
-FONT_TABLE = (FONT_FAMILY, 10)               # 表格/分组标题
+# ================= 队列消息类型与文件状态（worker → GUI 协议常量） =================
+# 队列消息统一为 (tag, ...) 元组：第一元素为类型标签，其余为负载。
+# 字段结构说明（GUI 在 ui/app.py 中按标签分发，请勿随意改动以下常量值）：
+#   MSG_PROGRESS      -> (total_percent: float, done: int, total: int)
+#   MSG_FILE_START    -> (video_name: str)
+#   MSG_FILE_STATUS   -> (video_name: str, status: STATUS_*)
+#   MSG_FILE_PROGRESS -> (video_name: str, percent: float)
+#   MSG_FILE_ESTIMATE -> (video_name: str, estimate_seconds: float)
+#   MSG_DONE          -> (merged_count: int, output_folder: str)
+#   MSG_STOPPED       -> ()
+#   MSG_ERROR         -> (message: str)
+#   MSG_FFMPEG_ERROR  -> (video_name: str, detail: str)
+#   MSG_LOG           -> (message: str)   # 历史保留：GUI 目前不消费
+MSG_PROGRESS = "progress"
+MSG_FILE_START = "file_start"
+MSG_FILE_STATUS = "file_status"
+MSG_FILE_PROGRESS = "file_progress"
+MSG_FILE_ESTIMATE = "file_estimate"
+MSG_DONE = "done"
+MSG_STOPPED = "stopped"
+MSG_ERROR = "error"
+MSG_FFMPEG_ERROR = "ffmpeg_error"
+MSG_LOG = "log"
+
+# 文件状态（Treeview“状态”列的取值，GUI 与 worker 共用）
+STATUS_QUEUED = "已提交"           # 仅 GUI 插入
+STATUS_PROCESSING = "处理中"
+STATUS_DONE = "完成"
+STATUS_FAILED = "失败"
+STATUS_AUDIO_MISSING = "未找到音频"
+STATUS_ERROR = "错误"
+STATUS_STOPPED = "已停止"
+
+# 仓库根目录（本文件所在目录，即旧 media.pyw 所在目录），
+# 供 UI 把 ffmpeg_error.log 写到与原版一致的位置。
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def recommended_workers():
+    """GUI 默认并行度：min(DEFAULT_MAX_WORKERS, max(2, CPU核数//4))。
+
+    与 merge_media 对用户输入的钳制逻辑同源（默认值从不超过
+    DEFAULT_MAX_WORKERS），供 ui/app.py 初始化“线程数”输入框。
+    """
+    total_cores = multiprocessing.cpu_count()
+    return min(DEFAULT_MAX_WORKERS, max(2, total_cores // 4))
 
 
 def build_ffmpeg_command(video_path, audio_path, output_path, ffmpeg_threads):
     """构造无损合并所需的 FFmpeg 命令。"""
+    # 参数含义：
+    #   -hide_banner / -loglevel error / -nostats：屏蔽无关提示，只保留错误
+    #   -progress pipe:1：以 key=value 形式把进度写入 stdout，供本程序解析
+    #   -map 0:v:0 -map 1:a:0：视频流取第 1 个输入，音频流取第 2 个输入
+    #   -threads：控制本次合并使用的编解码线程数
+    #   -c copy：直接复制流而不重新编码（无损、速度最快）
+    #   -movflags +faststart：把 moov 元数据移到文件头部，便于"边下边播"
+    #   -y：输出文件已存在时直接覆盖
     return [
         FFMPEG_PATH,
         "-hide_banner",
@@ -84,6 +142,10 @@ def get_media_duration(video_path):
     """返回视频时长（秒），用于估算进度百分比。"""
     ffprobe_path = get_ffprobe_path()
 
+    # 让 ffprobe 只输出时长：
+    #   -v error              关闭多余日志
+    #   -show_entries format=duration  只查询容器总时长
+    #   -of ... nokey=1       输出纯数字（如 12.340000），便于直接转 float
     cmd = [
         ffprobe_path,
         "-v", "error",
@@ -92,52 +154,69 @@ def get_media_duration(video_path):
         video_path,
     ]
     try:
+        # creationflags 用于 Windows 下隐藏弹出的控制台窗口
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 creationflags=CREATE_NO_WINDOW)
         if result.returncode != 0:
+            # ffprobe 解析失败（文件损坏等），返回 None 由调用方兜底
             return None
+        # 去掉末尾换行后转为秒数
         return float(result.stdout.strip())
     except Exception:
+        # 任何异常都返回 None，不让探测失败影响整体流程
         return None
 
 
 def estimate_finalization_time(video_path, audio_path, duration=None):
     """根据视频长度和文件体积，估算最后封装/收尾所需时间。"""
+    # 优先用调用方传入的时长，否则现场用 ffprobe 探测
     if duration is None:
         duration = get_media_duration(video_path)
+    # 探测失败时按 10 分钟兜底，避免后续进度估算失效
     if duration is None:
         duration = 600
 
+    # 把视频、音频的文件体积换算为 MB（文件不存在时按 0 处理）
     video_size_mb = os.path.getsize(video_path) / (1024 * 1024) if os.path.exists(video_path) else 0.0
     audio_size_mb = os.path.getsize(audio_path) / (1024 * 1024) if os.path.exists(audio_path) else 0.0
+    # max() 保证分母不为 0，避免极小文件导致估算异常
     total_size_mb = max(video_size_mb, 1.0) + max(audio_size_mb, 0.0)
     duration_min = max(duration / 60.0, 1.0)
 
+    # 经验公式：固定开销 1.5s + 每 120MB 约 1s + 每分钟时长约 0.3s
     estimate_seconds = 1.5 + total_size_mb / 120.0 + duration_min * 0.3
+    # 实际收尾时间基本落在 2~60 秒内，把估算值夹紧到该区间
     return round(min(60.0, max(2.0, estimate_seconds)), 1)
 
 
 def merge_single_media(video_path, audio_path, output_path, ffmpeg_threads, progress_queue, video_name, stop_event):
     """合并单个视频和音频，仅进行无损流复制。"""
+    # 延迟 import：只有真正进入工作线程时才加载，加快程序启动速度
     import time
+    # 略微等待，让同一批 worker 错峰启动，降低瞬时 CPU 抢占
     time.sleep(0.05)
 
+    # 音频文件不存在则直接标记失败，无需拉起 FFmpeg 进程
     if not os.path.exists(audio_path):
-        progress_queue.put(("file_status", video_name, "未找到音频"))
+        progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_AUDIO_MISSING))
         return False
 
-    progress_queue.put(("file_status", video_name, "处理中"))
+    progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_PROCESSING))
 
+    # 提交前再检查一次停止标志，避免白启动子进程
     if stop_event.is_set():
-        progress_queue.put(("file_status", video_name, "已停止"))
+        progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_STOPPED))
         return False
 
+    # 预先探测时长并估算收尾耗时，供主线程计算并显示进度
     duration = get_media_duration(video_path)
     estimated_finalization = estimate_finalization_time(video_path, audio_path, duration)
-    progress_queue.put(("file_estimate", video_name, estimated_finalization))
+    progress_queue.put((MSG_FILE_ESTIMATE, video_name, estimated_finalization))
     cmd = build_ffmpeg_command(video_path, audio_path, output_path, ffmpeg_threads)
 
     try:
+        # text=True + bufsize=1：按行读取子进程输出；
+        # stdout 用于解析 -progress 进度，stderr 用于收集错误信息
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -146,9 +225,10 @@ def merge_single_media(video_path, audio_path, output_path, ffmpeg_threads, prog
             creationflags=CREATE_NO_WINDOW,
             bufsize=1,
         )
-        stderr_lines = []
+        stderr_lines = []  # 存放 stderr 输出的每一行
 
         def _read_err():
+            # 持续读取并暂存 stderr，避免管道写满导致 ffmpeg 被阻塞
             try:
                 if proc.stderr:
                     for line in proc.stderr:
@@ -156,10 +236,12 @@ def merge_single_media(video_path, audio_path, output_path, ffmpeg_threads, prog
             except Exception:
                 pass
 
+        # 用守护线程专门排空 stderr，防止输出较多时与主循环互相等待
         err_thread = threading.Thread(target=_read_err, daemon=True)
         err_thread.start()
 
         while True:
+            # 用户点击"停止"时：先温和 terminate，超时仍未退出则强制 kill
             if stop_event.is_set():
                 try:
                     proc.terminate()
@@ -169,13 +251,14 @@ def merge_single_media(video_path, audio_path, output_path, ffmpeg_threads, prog
                         proc.kill()
                     except Exception:
                         pass
-                progress_queue.put(("file_status", video_name, "已停止"))
+                progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_STOPPED))
                 return False
 
             if not proc.stdout:
-                progress_queue.put(("file_status", video_name, "错误"))
+                progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_ERROR))
                 break
 
+            # readline 读到空串且进程已结束，说明输出流读完，正常退出循环
             line = proc.stdout.readline()
             if line == "" and proc.poll() is not None:
                 break
@@ -183,26 +266,32 @@ def merge_single_media(video_path, audio_path, output_path, ffmpeg_threads, prog
                 continue
 
             line = line.strip()
+            # -progress 输出的每行都是 "key=value" 形式，非此格式的行直接忽略
             if "=" not in line:
                 continue
 
             key, value = line.split("=", 1)
+            # out_time_ms：FFmpeg 已处理的毫秒数，换算成百分比
             if key == "out_time_ms" and duration:
                 try:
                     current_ms = int(value)
+                    # 上限 99%：最后的 moov/mux 收尾阶段不计入 out_time
                     percent = min(99.0, current_ms / 1000.0 / duration * 100.0)
-                    progress_queue.put(("file_progress", video_name, percent))
+                    progress_queue.put((MSG_FILE_PROGRESS, video_name, percent))
                 except ValueError:
                     pass
+            # 出现 progress=end 表示 FFmpeg 处理完毕，先把进度固定到 99%
             elif key == "progress" and value == "end" and duration:
-                progress_queue.put(("file_progress", video_name, 99.0))
+                progress_queue.put((MSG_FILE_PROGRESS, video_name, 99.0))
 
         try:
+            # 主循环结束后再回收一次退出码（某些情况下 wait 会抛异常，用 poll 兜底）
             return_code = proc.wait()
         except Exception:
             return_code = proc.poll()
 
         try:
+            # 清空残留输出，确保子进程完全退出
             proc.communicate(timeout=5)
         except Exception:
             try:
@@ -217,60 +306,76 @@ def merge_single_media(video_path, audio_path, output_path, ffmpeg_threads, prog
 
         stderr_text = "\n".join(stderr_lines).strip()
         if return_code == 0:
+            # 返回码为 0 时还要确认输出文件真实存在且非空，才算真正成功
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                progress_queue.put(("file_status", video_name, "完成"))
-                progress_queue.put(("file_progress", video_name, 100.0))
+                progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_DONE))
+                progress_queue.put((MSG_FILE_PROGRESS, video_name, 100.0))
                 return True
-            progress_queue.put(("file_status", video_name, "失败"))
+            # ffmpeg 成功但没产出文件（罕见），视为失败
+            progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_FAILED))
             if stderr_text:
-                progress_queue.put(("ffmpeg_error", video_name, stderr_text))
+                progress_queue.put((MSG_FFMPEG_ERROR, video_name, stderr_text))
             return False
 
-        progress_queue.put(("file_status", video_name, "失败"))
+        # 返回码非 0：合并失败，附带收集到的 stderr 错误信息
+        progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_FAILED))
         if stderr_text:
-            progress_queue.put(("ffmpeg_error", video_name, stderr_text))
+            progress_queue.put((MSG_FFMPEG_ERROR, video_name, stderr_text))
         return False
     except Exception:
+        # Popen 启动或运行阶段抛出异常：回传错误状态与完整堆栈
         tb = traceback.format_exc()
-        progress_queue.put(("file_status", video_name, "错误"))
-        progress_queue.put(("ffmpeg_error", video_name, tb))
+        progress_queue.put((MSG_FILE_STATUS, video_name, STATUS_ERROR))
+        progress_queue.put((MSG_FFMPEG_ERROR, video_name, tb))
         return False
 
 
 def merge_media(folder, progress_queue, stop_event, max_workers):
     """批量合并媒体文件，仅做无损流复制。"""
     files = os.listdir(folder)
+    # 以 .mp4 结尾的文件作为"视频"候选（不区分大小写）
     videos = [f for f in files if f.lower().endswith('.mp4')]
     total_videos = len(videos)
-    merged_count = 0
+    merged_count = 0  # 统计成功合并的数量
 
     if total_videos == 0:
-        progress_queue.put(("error", "未找到MP4文件"))
+        # 没有任何可处理的视频时直接报错返回，不进入并行逻辑
+        progress_queue.put((MSG_ERROR, "未找到MP4文件"))
         return
 
+    # 合并结果统一输出到源目录下的 output 子文件夹，避免覆盖原文件
     output_folder = os.path.join(folder, "output")
     os.makedirs(output_folder, exist_ok=True)
 
-    total_cores = multiprocessing.cpu_count()
-    max_workers = max(1, min(8, int(max_workers or max(2, total_cores // 4))))
+    # ---- 并发策略 ----
+    total_cores = multiprocessing.cpu_count()  # 读取本机 CPU 总核数
+    # 并行 worker 数 = 用户设置（默认与 CPU 核数相关），但封顶为 DEFAULT_MAX_WORKERS
+    max_workers = max(1, min(DEFAULT_MAX_WORKERS, int(max_workers or max(2, total_cores // 4))))
+    # 再把核数平均分给每个 worker 作为其 ffmpeg 的 -threads，
+    # 使"worker数 × 线程数"不超过 CPU 总核数，避免过度竞争
     ffmpeg_threads = max(1, total_cores // max_workers)
 
-    progress_queue.put(("log", f"找到 {total_videos} 个视频文件"))
-    progress_queue.put(("log", f"使用 {max_workers} 个线程并行处理\n"))
+    progress_queue.put((MSG_LOG, f"找到 {total_videos} 个视频文件"))
+    progress_queue.put((MSG_LOG, f"使用 {max_workers} 个线程并行处理\n"))
 
     futures = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for video in videos:
+            # 命名约定：abc.mp4 对应的音频必须是同目录下的同名 abc.m4a
             base_name = os.path.splitext(video)[0]
             audio = base_name + '.m4a'
             video_path = os.path.join(folder, video)
             audio_path = os.path.join(folder, audio)
+            # 输出到 output 子目录，文件名与原视频保持一致
             output_path = os.path.join(output_folder, video)
 
+            # 用户停止后不再提交新的任务
             if stop_event.is_set():
                 break
 
-            progress_queue.put(("file_start", video))
+            progress_queue.put((MSG_FILE_START, video))
+            # 提交给线程池执行，并记录 future -> 视频名 的映射，
+            # 方便随后按完成顺序统计结果
             future = executor.submit(
                 merge_single_media,
                 video_path,
@@ -283,263 +388,26 @@ def merge_media(folder, progress_queue, stop_event, max_workers):
             )
             futures[future] = video
 
+        # 提交阶段若已被要求停止，直接收尾，不再等待结果
         if stop_event.is_set():
-            progress_queue.put(("stopped",))
+            progress_queue.put((MSG_STOPPED,))
             return
 
+        # as_completed：哪个任务先完成就先处理哪个，进度实时累计
         for future in as_completed(futures):
             if stop_event.is_set():
                 break
             if future.result():
                 merged_count += 1
-            progress_queue.put(("progress", (merged_count / total_videos) * 100, merged_count, total_videos))
+            # 每次有文件完成就汇报一次总体进度（百分比、完成数、总数）
+            progress_queue.put((MSG_PROGRESS, (merged_count / total_videos) * 100, merged_count, total_videos))
 
     if not stop_event.is_set():
-        progress_queue.put(("done", merged_count, output_folder))
+        # 正常走完（未被停止）才发送"完成"信号
+        progress_queue.put((MSG_DONE, merged_count, output_folder))
 
 
 def start_merge_thread(folder, progress_queue, stop_event, max_workers):
     """在后台线程运行合并任务。"""
+    # daemon=True：主程序退出时后台线程随之终止，不会阻塞进程结束
     threading.Thread(target=merge_media, args=(folder, progress_queue, stop_event, max_workers), daemon=True).start()
-
-
-def choose_directory(initial_dir=None, title="选择文件夹"):
-    """通过 dialogs.py 选择文件夹，取消时返回空字符串。"""
-    return choose_folder(title=title, initial_dir=initial_dir)
-
-
-def select_folder_and_merge():
-    """创建 GUI 并处理文件夹选择"""
-    root = tk.Tk()
-    root.title("视频音频合并器")
-    root.geometry("700x550")
-    root.resizable(False, False)
-
-    progress_queue = queue.Queue()
-    file_items = {}  # 存储每个文件在 Treeview 中的 item id
-    file_progresses = {}
-    estimate_by_file = {}
-    stop_event = threading.Event()
-    total_cores = multiprocessing.cpu_count()
-    default_workers = min(DEFAULT_MAX_WORKERS, max(2, total_cores // 4))
-
-    title_label = tk.Label(root, text="视频音频合并工具", font=FONT_TITLE)
-    title_label.pack(pady=10)
-
-    progress_frame = tk.Frame(root)
-    progress_frame.pack(pady=10, padx=20, fill=tk.X)
-
-    progress_bar = ttk.Progressbar(progress_frame, orient="horizontal", length=500, mode="determinate")
-    progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-    percent_label = tk.Label(progress_frame, text="0%", font=FONT_PERCENT, width=6)
-    percent_label.pack(side=tk.LEFT, padx=5)
-
-    status_label = tk.Label(root, text="等待开始...", font=FONT_NORMAL)
-    status_label.pack(pady=5)
-
-    settings_frame = tk.Frame(root)
-    settings_frame.pack(pady=(0, 5), anchor="center")
-
-    thread_label = tk.Label(settings_frame, text="线程数：")
-    thread_label.pack(side=tk.LEFT)
-    thread_var = tk.StringVar(value=str(default_workers))
-    thread_entry = ttk.Spinbox(settings_frame, from_=1, to=16, textvariable=thread_var, width=8)
-    thread_entry.pack(side=tk.LEFT, padx=(0, 8))
-    cpu_label = tk.Label(settings_frame, text=f"CPU总数: {total_cores}")
-    cpu_label.pack(side=tk.LEFT, padx=(0, 8))
-    reset_thread_btn = tk.Button(settings_frame, text="恢复默认", command=lambda: thread_var.set(str(default_workers)), font=FONT_SMALL)
-    reset_thread_btn.pack(side=tk.LEFT)
-
-    button_frame = tk.Frame(root)
-    button_frame.pack(pady=5, anchor="center")
-
-    def set_controls_state(enabled):
-        start_btn.config(state=tk.NORMAL if enabled else tk.DISABLED)
-        thread_entry.config(state="normal" if enabled else tk.DISABLED)
-        reset_thread_btn.config(state=tk.NORMAL if enabled else tk.DISABLED)
-        if enabled:
-            stop_btn.config(state=tk.DISABLED)
-
-    def start_merge():
-        folder_selected = choose_directory(
-            initial_dir=DEFAULT_FOLDER,
-            title="选择包含视频和音频的文件夹",
-        )
-        if folder_selected:
-            stop_event.clear()
-            progress_bar['value'] = 0
-            percent_label.config(text="0%")
-            status_label.config(text="正在准备...")
-            for item_id in tree.get_children():
-                tree.delete(item_id)
-            file_items.clear()
-            file_progresses.clear()
-            estimate_by_file.clear()
-            set_controls_state(False)
-            stop_btn.config(state=tk.NORMAL)
-            start_merge_thread(folder_selected, progress_queue, stop_event, thread_var.get())
-
-    start_btn = tk.Button(
-        button_frame,
-        text="选择文件夹并开始合并",
-        command=start_merge,
-        font=FONT_BTN_BOLD,
-        bg="#4CAF50",
-        fg="white",
-        activebackground="#45a049",
-        cursor="hand2",
-        height=2,
-    )
-    start_btn.pack(side=tk.LEFT, padx=10, pady=(0, 5))
-
-    stop_btn = tk.Button(
-        button_frame,
-        text="停止",
-        command=lambda: stop_event.set(),
-        font=FONT_BTN,
-        bg="#f44336",
-        fg="white",
-        activebackground="#d32f2f",
-        cursor="hand2",
-        height=2,
-    )
-    stop_btn.pack(side=tk.LEFT, padx=10)
-    stop_btn.config(state=tk.DISABLED)
-
-    info_text = "说明：选择包含 .mp4 和 .m4a 文件的文件夹，程序将自动匹配并进行无损合并"
-    info_label = tk.Label(root, text=info_text, font=FONT_SMALL, fg="gray")
-    info_label.pack(pady=5)
-
-    # 文件状态表格
-    table_frame = tk.LabelFrame(root, text="文件状态", font=FONT_TABLE)
-    table_frame.pack(pady=10, padx=20, fill=tk.BOTH, expand=True)
-
-    tree = ttk.Treeview(table_frame, columns=("file", "status", "percent"), show="headings", height=12)
-    tree.heading("file", text="文件名")
-    tree.heading("status", text="状态")
-    tree.heading("percent", text="完成率")
-    tree.column("file", width=360, anchor="w")
-    tree.column("status", width=120, anchor="center")
-    tree.column("percent", width=100, anchor="center")
-    tree.pack(padx=5, pady=5, fill=tk.BOTH, expand=True)
-
-    def update_gui():
-        """从 queue 更新进度条和文件表格"""
-        try:
-            while True:
-                item = progress_queue.get_nowait()
-
-                if item[0] == "progress":
-                    progress_percent, current, total = item[1], item[2], item[3]
-                    if not file_progresses:
-                        progress_bar['value'] = progress_percent
-                        percent_label.config(text=f"{progress_percent:.0f}%")
-                    pending_estimates = [value for value in estimate_by_file.values() if value > 0]
-                    if pending_estimates:
-                        status_label.config(text=f"已完成: {current}/{total} · 预计收尾: {max(pending_estimates):.1f}s")
-                    else:
-                        status_label.config(text=f"已完成: {current}/{total}")
-
-                elif item[0] == "file_start":
-                    video_name = item[1]
-                    file_progresses[video_name] = 0.0
-                    estimate_by_file[video_name] = 0.0
-                    item_id = tree.insert("", tk.END, values=(video_name, "已提交", "0%"))
-                    file_items[video_name] = item_id
-
-                elif item[0] == "file_status":
-                    video_name, status = item[1], item[2]
-                    if video_name in file_items:
-                        item_id = file_items[video_name]
-                        if status == "处理中":
-                            tree.set(item_id, "status", "处理中")
-                        elif status == "完成":
-                            tree.set(item_id, "status", "完成")
-                            tree.set(item_id, "percent", "100%")
-                            file_progresses[video_name] = 100.0
-                            estimate_by_file[video_name] = 0.0
-                        elif status == "失败":
-                            tree.set(item_id, "status", "失败")
-                            file_progresses[video_name] = 100.0
-                            estimate_by_file[video_name] = 0.0
-                        elif status == "未找到音频":
-                            tree.set(item_id, "status", "未找到音频")
-                            file_progresses[video_name] = 100.0
-                            estimate_by_file[video_name] = 0.0
-                        elif status == "错误":
-                            tree.set(item_id, "status", "错误")
-                            file_progresses[video_name] = 100.0
-                            estimate_by_file[video_name] = 0.0
-                        elif status == "已停止":
-                            tree.set(item_id, "status", "已停止")
-                            file_progresses[video_name] = 100.0
-                            estimate_by_file[video_name] = 0.0
-
-                elif item[0] == "file_progress":
-                    video_name, percent = item[1], item[2]
-                    if video_name in file_items:
-                        item_id = file_items[video_name]
-                        file_progresses[video_name] = percent
-                        tree.set(item_id, "percent", f"{percent:.0f}%")
-                        current_status = tree.set(item_id, "status")
-                        if current_status in {"已提交", "处理中"}:
-                            tree.set(item_id, "status", "处理中")
-
-                        total_progress = sum(file_progresses.values()) / max(1, len(file_progresses))
-                        progress_bar['value'] = total_progress
-                        percent_label.config(text=f"{total_progress:.0f}%")
-                        pending_estimates = [value for value in estimate_by_file.values() if value > 0]
-                        if pending_estimates:
-                            status_label.config(text=f"总体进度: {total_progress:.0f}% ({sum(1 for p in file_progresses.values() if p >= 100)}/{len(file_progresses)}) · 预计收尾: {max(pending_estimates):.1f}s")
-                        else:
-                            status_label.config(text=f"总体进度: {total_progress:.0f}% ({sum(1 for p in file_progresses.values() if p >= 100)}/{len(file_progresses)})")
-
-                elif item[0] == "file_estimate":
-                    video_name, estimate = item[1], item[2]
-                    estimate_by_file[video_name] = estimate
-
-                elif item[0] == "done":
-                    merged_count, output_folder = item[1], item[2]
-                    status_label.config(text="处理完成！")
-                    messagebox.showinfo("完成", f"已合并 {merged_count} 个文件\n保存位置：{output_folder}")
-                    set_controls_state(True)
-                    file_items.clear()
-                    file_progresses.clear()
-                    estimate_by_file.clear()
-
-                elif item[0] == "stopped":
-                    status_label.config(text="已停止")
-                    messagebox.showinfo("已停止", "合并已停止")
-                    set_controls_state(True)
-                    file_items.clear()
-                    file_progresses.clear()
-                    estimate_by_file.clear()
-
-                elif item[0] == "error":
-                    messagebox.showerror("错误", item[1])
-                    status_label.config(text="发生错误")
-                    set_controls_state(True)
-                elif item[0] == "ffmpeg_error":
-                    video_name, err = item[1], item[2]
-                    # 显示较短的错误摘要，并记录完整错误到脚本目录下的日志文件
-                    summary = err.splitlines()[:6]
-                    script_dir = os.path.dirname(os.path.abspath(__file__))
-                    log_path = os.path.join(script_dir, "ffmpeg_error.log")
-                    messagebox.showerror("FFmpeg 错误", f"{video_name}: {summary[0] if summary else '未知错误'}\n(详细日志已写入 {log_path})")
-                    try:
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            f.write(f"=== {video_name} @ {datetime.now().isoformat()} ===\n")
-                            f.write(err + "\n\n")
-                    except Exception:
-                        pass
-
-        except queue.Empty:
-            pass
-        root.after(100, update_gui)  # 每 100ms 检查一次 queue
-
-    root.after(100, update_gui)
-    root.mainloop()
-
-if __name__ == "__main__":
-    select_folder_and_merge()
