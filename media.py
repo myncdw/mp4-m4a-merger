@@ -30,23 +30,25 @@ IS_WINDOWS = sys.platform.startswith("win")
 # 仅在 Windows 上有意义，其它平台为 0（Popen 会忽略该参数）
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
-# ================= 默认值配置（放在开头集中管理） =================
-# FFmpeg 可执行文件路径（Windows 示例: r"C:\Tools\ffmpeg\bin\ffmpeg.exe"）
-DEFAULT_FFMPEG_PATH = "ffmpeg"  # Linux 下默认路径，请按需修改
-
-# 默认线程数上限（实际取 min(默认值, CPU相关计算)）
-DEFAULT_MAX_WORKERS = 8
+# ================= 后端内部默认值 =================
+# 用户可改的默认配置已集中到入口 main.pyw 顶部，启动时通过 configure()
+# 注入本模块；以下只是脱离入口单独导入（单元测试等）时的内置出厂值：
+#   _CONFIG_FFMPEG_PATH：ffmpeg 可执行文件默认路径
+#     （Windows 示例: r"C:\Tools\ffmpeg\bin\ffmpeg.exe"）
+#   _CONFIG_MAX_WORKERS：默认线程数上限（实际取 min(该值, CPU相关计算)）
+_CONFIG_FFMPEG_PATH = "ffmpeg"  # Linux 下默认命令名
+_CONFIG_MAX_WORKERS = 8
 
 
 def resolve_ffmpeg_path():
-    """跨平台解析 ffmpeg 路径：优先使用配置路径，否则从 PATH 中查找。"""
-    # Windows 下若已手动指定了存在的可执行文件路径，则直接使用该路径
-    if IS_WINDOWS and os.path.isfile(DEFAULT_FFMPEG_PATH):
-        return DEFAULT_FFMPEG_PATH
-    # 其它平台（如 Linux）通常直接依赖 PATH 环境变量中的 ffmpeg 命令
+    """跨平台解析 ffmpeg 路径：显式配置的路径若存在则优先，否则从 PATH 查找。"""
+    # 入口显式配置了存在的可执行文件路径（如 Windows 的 ffmpeg.exe）→ 直接使用
+    if os.path.isfile(_CONFIG_FFMPEG_PATH):
+        return _CONFIG_FFMPEG_PATH
+    # 否则（如 Linux 下的命令名 "ffmpeg"）依赖 PATH 环境变量中的 ffmpeg 命令
     found = shutil.which("ffmpeg")
-    # 都找不到时退回默认命令名，让后续调用自然报错，便于用户发现环境问题
-    return found or DEFAULT_FFMPEG_PATH
+    # 都找不到时退回配置的默认命令名，让后续调用自然报错，便于用户发现环境问题
+    return found or _CONFIG_FFMPEG_PATH
 
 
 FFMPEG_PATH = resolve_ffmpeg_path()  # Linux 下通常为 PATH 中的 "ffmpeg"
@@ -61,6 +63,25 @@ def get_ffprobe_path():
         return local
     # 否则从 PATH 中查找，找不到则返回命令名本身
     return shutil.which("ffprobe") or probe_exe
+
+
+def configure(ffmpeg_path=None, max_workers=None):
+    """用 main.pyw 顶部的用户配置覆盖后端默认值并使其生效。
+
+    - ffmpeg_path：ffmpeg 可执行文件路径；覆盖后立即按新值重新解析
+      FFMPEG_PATH（供 build_ffmpeg_command / get_ffprobe_path 使用）。
+    - max_workers：并发 worker 的封顶值（须 >= 1），影响
+      recommended_workers() 与 merge_media() 的钳制上限。
+
+    两个参数均可省略（省略则不修改对应项）；须在任何合并任务启动前调用。
+    """
+    global _CONFIG_FFMPEG_PATH, _CONFIG_MAX_WORKERS, FFMPEG_PATH
+    if ffmpeg_path is not None:
+        _CONFIG_FFMPEG_PATH = ffmpeg_path
+        # 立即按新配置重新解析，保证后续合并命令使用新路径
+        FFMPEG_PATH = resolve_ffmpeg_path()
+    if max_workers is not None:
+        _CONFIG_MAX_WORKERS = max(1, int(max_workers))
 
 
 # ================= 队列消息类型与文件状态（worker → GUI 协议常量） =================
@@ -102,13 +123,14 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def recommended_workers():
-    """GUI 默认并行度：min(DEFAULT_MAX_WORKERS, max(2, CPU核数//4))。
+    """GUI 默认并行度：min(_CONFIG_MAX_WORKERS, max(2, CPU核数//4))。
 
-    与 merge_media 对用户输入的钳制逻辑同源（默认值从不超过
-    DEFAULT_MAX_WORKERS），供 ui/app.py 初始化“线程数”输入框。
+    与 merge_media 对用户输入的钳制逻辑同源（默认值从不超过线程数上限
+    _CONFIG_MAX_WORKERS），供 ui/app.py 初始化“线程数”输入框。
+    线程数上限可由入口 main.pyw 通过 configure(max_workers=...) 调整。
     """
     total_cores = multiprocessing.cpu_count()
-    return min(DEFAULT_MAX_WORKERS, max(2, total_cores // 4))
+    return min(_CONFIG_MAX_WORKERS, max(2, total_cores // 4))
 
 
 def build_ffmpeg_command(video_path, audio_path, output_path, ffmpeg_threads):
@@ -349,8 +371,9 @@ def merge_media(folder, progress_queue, stop_event, max_workers):
 
     # ---- 并发策略 ----
     total_cores = multiprocessing.cpu_count()  # 读取本机 CPU 总核数
-    # 并行 worker 数 = 用户设置（默认与 CPU 核数相关），但封顶为 DEFAULT_MAX_WORKERS
-    max_workers = max(1, min(DEFAULT_MAX_WORKERS, int(max_workers or max(2, total_cores // 4))))
+    # 并行 worker 数 = 用户设置（默认与 CPU 核数相关），但封顶为线程数上限
+    # （默认 8，可由入口 main.pyw 经 configure(max_workers=...) 调整）
+    max_workers = max(1, min(_CONFIG_MAX_WORKERS, int(max_workers or max(2, total_cores // 4))))
     # 再把核数平均分给每个 worker 作为其 ffmpeg 的 -threads，
     # 使"worker数 × 线程数"不超过 CPU 总核数，避免过度竞争
     ffmpeg_threads = max(1, total_cores // max_workers)

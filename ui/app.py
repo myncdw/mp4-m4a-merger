@@ -23,8 +23,14 @@ from ui import theme
 class MediaMergerApp(tk.Tk):
     """视频音频合并器主窗口（自身即 Tk 根窗口，无需额外 root）。"""
 
-    def __init__(self):
+    def __init__(self, default_folder=""):
+        """主窗口。
+
+        default_folder：文件选择对话框的默认打开目录；由入口 main.pyw 的
+        DEFAULT_FOLDER 传入（空字符串表示使用系统默认位置）。
+        """
         super().__init__()
+        self.default_folder = default_folder
         self.title("视频音频合并器")
         self.geometry("700x550")
         self.resizable(False, False)  # 固定窗口大小，简化布局
@@ -159,7 +165,7 @@ class MediaMergerApp(tk.Tk):
         """选择文件夹并启动新一轮合并。"""
         # 弹窗选择文件夹；取消时返回空串，直接跳过本次操作
         folder_selected = dialogs.choose_folder(
-            initial_dir=theme.DEFAULT_FOLDER,
+            initial_dir=self.default_folder,
             title="选择包含视频和音频的文件夹",
         )
         if folder_selected:

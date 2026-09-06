@@ -151,22 +151,76 @@ class EstimateFinalizationTest(unittest.TestCase):
 
 
 class RecommendedWorkersTest(unittest.TestCase):
-    """recommended_workers：与 DEFAULT_MAX_WORKERS 的封顶关系。"""
+    """recommended_workers：与 configure(max_workers=...) 设定的上限的封顶关系。"""
+
+    def setUp(self):
+        # 记录模块级配置状态，用例结束后恢复，避免相互污染
+        self._snapshot = (media._CONFIG_MAX_WORKERS, media._CONFIG_FFMPEG_PATH, media.FFMPEG_PATH)
+
+    def tearDown(self):
+        (media._CONFIG_MAX_WORKERS, media._CONFIG_FFMPEG_PATH, media.FFMPEG_PATH) = self._snapshot
 
     def _patch_cpu_count(self, cores):
         return mock.patch("media.multiprocessing.cpu_count", return_value=cores)
 
-    def test_many_cores_capped_by_default_max_workers(self):
+    def test_many_cores_capped_by_max_workers(self):
+        media.configure(max_workers=8)
         with self._patch_cpu_count(128):
-            self.assertEqual(media.recommended_workers(), media.DEFAULT_MAX_WORKERS)
+            self.assertEqual(media.recommended_workers(), 8)
+
+    def test_configured_lower_cap_limits_workers(self):
+        media.configure(max_workers=3)
+        with self._patch_cpu_count(128):
+            self.assertEqual(media.recommended_workers(), 3)
 
     def test_low_core_count_floor_of_two(self):
+        media.configure(max_workers=8)
         with self._patch_cpu_count(4):
             self.assertEqual(media.recommended_workers(), 2)
 
     def test_typical_desktop(self):
+        media.configure(max_workers=8)
         with self._patch_cpu_count(16):
             self.assertEqual(media.recommended_workers(), 4)
+
+
+class ConfigureTest(unittest.TestCase):
+    """configure()：入口配置注入后端并生效。"""
+
+    def setUp(self):
+        self._snapshot = (media._CONFIG_MAX_WORKERS, media._CONFIG_FFMPEG_PATH, media.FFMPEG_PATH)
+
+    def tearDown(self):
+        (media._CONFIG_MAX_WORKERS, media._CONFIG_FFMPEG_PATH, media.FFMPEG_PATH) = self._snapshot
+
+    def test_ffmpeg_path_reconfigured(self):
+        # 配置一个真实存在的路径（不实际执行），应优先于 PATH 生效
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "ffmpeg-fake")
+            with open(fake, "wb") as f:
+                f.write(b"# fake ffmpeg\n")
+            media.configure(ffmpeg_path=fake)
+            cmd = media.build_ffmpeg_command("a.mp4", "a.m4a", "o.mp4", 2)
+            self.assertEqual(cmd[0], fake)
+            self.assertEqual(media.FFMPEG_PATH, fake)
+
+    def test_nonexistent_configured_path_falls_back_to_path(self):
+        media.configure(ffmpeg_path="/no/such/ffmpeg-bin")
+        found = __import__("shutil").which("ffmpeg")
+        self.assertEqual(media.FFMPEG_PATH, found or "ffmpeg")
+
+    def test_partial_configure_keeps_other_setting(self):
+        old_path = media.FFMPEG_PATH
+        media.configure(max_workers=4)
+        self.assertEqual(media.FFMPEG_PATH, old_path, "只改线程数不应影响 ffmpeg 路径")
+        old_cap = media._CONFIG_MAX_WORKERS
+        media.configure(ffmpeg_path="/fake/bin/ffmpeg")
+        self.assertEqual(media._CONFIG_MAX_WORKERS, old_cap, "只改路径不应影响线程数上限")
+
+    def test_max_workers_floor_at_one(self):
+        media.configure(max_workers=0)
+        with mock.patch("media.multiprocessing.cpu_count", return_value=128):
+            self.assertEqual(media.recommended_workers(), 1)
 
 
 if __name__ == "__main__":
