@@ -3,7 +3,7 @@
 包含窗口布局、控件构建、消息队列轮询与分发、文件状态表格、
 错误弹窗与日志落盘等全部 UI 关注点。
 
-依赖方向（单向）：ui.app -> media / dialogs / ui.theme；
+依赖方向（单向）：ui.app -> media / xdg_dialogs / ui.theme；
 本文件不包含任何合并/调度逻辑（见 media.py），消息协议常量
 （media.MSG_*/media.STATUS_*）集中定义在后端 media.py。
 """
@@ -15,7 +15,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from datetime import datetime
 
-import dialogs
+import xdg_dialogs
 import media
 from ui import theme
 
@@ -164,8 +164,8 @@ class MediaMergerApp(tk.Tk):
     def _start_merge(self):
         """选择文件夹并启动新一轮合并。"""
         # 弹窗选择文件夹；取消时返回空串，直接跳过本次操作
-        folder_selected = dialogs.choose_folder(
-            initial_dir=self.default_folder,
+        folder_selected = xdg_dialogs.choose_folder(
+            initialdir=self.default_folder,
             title="选择包含视频和音频的文件夹",
         )
         if folder_selected:

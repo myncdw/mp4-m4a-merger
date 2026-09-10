@@ -2,6 +2,10 @@
 
 跨平台（Windows / Linux）GUI 工具，使用 FFmpeg 批量将同名的 .mp4 视频和 .m4a 音频合并为带音轨的 MP4 文件。支持多线程并行处理与进度实时显示。
 
+## 依赖
+
+本项目依赖 [xdg-dialogs](https://github.com/myncdw/xdg_dialogs)（未发布到 PyPI），请先获取
+
 ## 特性
 - 基于 Tkinter 的桌面 GUI
 - 自动匹配同名的 .mp4 与 .m4a 文件
